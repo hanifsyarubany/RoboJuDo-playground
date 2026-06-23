@@ -243,6 +243,19 @@ class ProtoMotionsTrackerPolicy(Policy):
                     # would be performed.
                     self._frame = 0
                     self._motion_done = False
+                    # Re-align the kick clip to the robot's CURRENT heading.
+                    # The heading offset is computed once at spawn and frozen.
+                    # In walk mode the mimic reference is gated OFF inside the
+                    # ONNX, so a stale heading offset is invisible — but the
+                    # moment the kick turns on, the kick clip's anchor-rotation
+                    # reference (mimic.future_anchor_rot) is fed through and, if
+                    # the robot has since turned while walking, it points the
+                    # torso at the OLD world heading.  The policy then twists to
+                    # that stale heading instead of kicking forward and the kick
+                    # fails.  Forcing a recompute makes the kick face wherever
+                    # the robot currently faces — what the MuJoCo unit test gets
+                    # for free by teleporting to frame 0 each episode.
+                    self._heading_offset = None
                 state = "ON" if new_kick > 0.5 else "OFF"
                 logger.info(f"[TrackerPolicy] kick_trigger={state}")
         # Recompute cmd_vel from the union of currently held keys.
