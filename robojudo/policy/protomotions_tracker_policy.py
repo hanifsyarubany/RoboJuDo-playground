@@ -101,6 +101,7 @@ class ProtoMotionsTrackerPolicy(Policy):
             raise ValueError("ProtoMotionsTrackerPolicyCfg must set motion_path")
         motion_index = getattr(cfg_policy, "motion_index", 0)
         timing = self._meta["timing"]
+        self._control_dt = float(timing["control_dt"])
         self._player = MotionPlayer(
             motion_path, motion_index=motion_index, control_dt=timing["control_dt"]
         )
@@ -181,6 +182,14 @@ class ProtoMotionsTrackerPolicy(Policy):
         "e": np.array([ 0.0,  0.0, -0.5], dtype=np.float32),
     }
 
+    # Gait-phase clock period (Stage-3 v11+ ONNX only). MUST match
+    # GAIT_CYCLE_TIME in stage3_training/stage3_env.py -- a mismatch desyncs
+    # the deployed gait's cadence from the one the policy was trained against.
+    # Harmless for older (pre-v11) ONNX exports: cmd.phase is only forwarded
+    # to the model if the loaded ONNX actually declares a cmd_phase input
+    # (see the onnx_in_names-driven filter in get_observation).
+    _GAIT_CYCLE_TIME = 0.9
+
     def reset(self):
         self._frame = 0
         self._prev_pd = None
@@ -200,6 +209,12 @@ class ProtoMotionsTrackerPolicy(Policy):
         # Updated each step via keyboard events or external ctrl_data.
         self._cmd_vel = np.zeros(3, dtype=np.float32)
         self._cmd_kick = np.zeros(1, dtype=np.float32)
+        # Stage-3 v11+ gait-phase clock. Free-running, advanced once per
+        # control step in get_observation regardless of walk/kick mode
+        # (mirrors G1Stage3Env.post_physics_step's unconditional advance --
+        # only the reward/obs terms that consume it are mode-gated, not the
+        # clock itself). Reset to 0 here so a fresh episode starts in phase.
+        self._gait_phase = 0.0
         # Set of currently held velocity-command keys (for hold-to-walk).
         self._held_keys: set[str] = set()
 
@@ -371,12 +386,22 @@ class ProtoMotionsTrackerPolicy(Policy):
             # Updated each step by _process_keyboard_for_cmd(); zero by default.
             "cmd.vel": self._cmd_vel[None],
             "cmd.kick": self._cmd_kick[None],
+            # Stage-3 v11+ gait-phase clock (sin/cos computed in-graph). Only
+            # picked up below if the loaded ONNX actually has a cmd_phase
+            # input -- a no-op dict entry for older Stage-1/2 exports.
+            "cmd.phase": np.array([self._gait_phase], dtype=np.float32)[None],
         }
         onnx_inputs = {}
         for onnx_name in self._onnx_in_names:
             sem_key = self._onnx_name_to_key.get(onnx_name)
             if sem_key and sem_key in key_to_array:
                 onnx_inputs[onnx_name] = key_to_array[sem_key].astype(np.float32)
+
+        # Advance the gait-phase clock for the NEXT step. Must happen exactly
+        # once per control step, after this step's value was captured into
+        # key_to_array above -- matches test_tracker_mujoco.py's capture-then-
+        # advance ordering and G1Stage3Env's per-step phase increment.
+        self._gait_phase = (self._gait_phase + self._control_dt / self._GAIT_CYCLE_TIME) % 1.0
 
         # -- ONNX inference --
         ort_out = self._session.run(self._onnx_out_names, onnx_inputs)
